@@ -20,8 +20,9 @@ from omegaconf import OmegaConf
 import wandb
 
 from dataset import CustomINH5Dataset, CustomDirDataset
-from loss.losses import ReconstructionLoss_Single_Stage
+from loss.losses import ReconstructionLoss_Single_Stage, compute_alignment_loss
 from models.invae import vae_models
+from models.meikai import AE_F32D256
 from models.sit import SiT_models
 from samplers import euler_sampler
 from utils import load_encoders, normalize_latents, denormalize_latents, preprocess_imgs_vae, count_trainable_params
@@ -165,6 +166,10 @@ def main(args):
         assert args.resolution % 16 == 0, "Image size must be divisible by 16 (for the VAE encoder)."
         latent_size = args.resolution // 16
         in_channels = 32
+    elif args.vae == "f32d256":
+        assert args.resolution % 32 == 0, "Image size must be divisible by 32 (for the MeiKai encoder)."
+        latent_size = args.resolution // 32
+        in_channels = 256
     else:
         raise NotImplementedError()
 
@@ -192,10 +197,18 @@ def main(args):
     model = model.to(device)
     ema = copy.deepcopy(model).to(device)  # Create an EMA of the model for use after training
 
-    # Create VAE with random initialization
-    vae = vae_models[args.vae]().to(device)
+    # Create autoencoder
+    if args.vae == "f32d256":
+        # Use MeiKai autoencoder with f=32 compression
+        ae = AE_F32D256().to(device)
+        use_vae = False  # MeiKai is a deterministic autoencoder, not VAE
+    else:
+        # Use traditional VAE
+        ae = vae_models[args.vae]().to(device)
+        use_vae = True
+    
     requires_grad(ema, False)
-    print("Total trainable params in VAE:", count_trainable_params(vae))
+    print(f"Total trainable params in {'AE' if not use_vae else 'VAE'}:", count_trainable_params(ae))
 
     # Initialize latents stats with neutral defaults for BN layer initialization
     # These will be learned during training from scratch
@@ -209,7 +222,7 @@ def main(args):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
     loss_cfg = OmegaConf.load(args.loss_cfg_path)
-    vae_loss_fn = ReconstructionLoss_Single_Stage(loss_cfg).to(device)
+    ae_loss_fn = ReconstructionLoss_Single_Stage(loss_cfg).to(device)
 
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -219,7 +232,7 @@ def main(args):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    # Define the optimizers for SiT, VAE, and VAE loss function separately
+    # Define the optimizers for SiT, AE/VAE, and AE/VAE loss function separately
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -227,15 +240,15 @@ def main(args):
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-    optimizer_vae = torch.optim.AdamW(
-        vae.parameters(),
+    optimizer_ae = torch.optim.AdamW(
+        ae.parameters(),
         lr=args.vae_learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
     optimizer_loss_fn = torch.optim.AdamW(
-        vae_loss_fn.parameters(),
+        ae_loss_fn.parameters(),
         lr=args.disc_learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -267,12 +280,12 @@ def main(args):
     # Start with eval mode for all models
     model.eval()
     ema.eval()
-    vae.eval()
+    ae.eval()
 
     if args.disc_pretrained_ckpt is not None:
         # Load the discriminator from a pretrained checkpoint if provided
         disc_ckpt = torch.load(args.disc_pretrained_ckpt, map_location=device)
-        vae_loss_fn.discriminator.load_state_dict(disc_ckpt)
+        ae_loss_fn.discriminator.load_state_dict(disc_ckpt)
         if accelerator.is_main_process:
             logger.info(f"Loaded discriminator from {args.disc_pretrained_ckpt}")
 
@@ -286,10 +299,10 @@ def main(args):
         ckpt = torch.load(ckpt_path, map_location='cpu')
         model.load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
-        vae.load_state_dict(ckpt['vae'])
-        vae_loss_fn.discriminator.load_state_dict(ckpt['discriminator'])
+        ae.load_state_dict(ckpt['ae'])
+        ae_loss_fn.discriminator.load_state_dict(ckpt['discriminator'])
         optimizer.load_state_dict(ckpt['opt']),
-        optimizer_vae.load_state_dict(ckpt['opt_vae'])
+        optimizer_ae.load_state_dict(ckpt['opt_ae'])
         optimizer_loss_fn.load_state_dict(ckpt['opt_disc'])
         global_step = ckpt['steps']
 
@@ -299,11 +312,11 @@ def main(args):
     # Model compilation for better performance
     if args.compile:
         model = torch.compile(model, backend="inductor", mode="default")
-        vae = torch.compile(vae, backend="inductor", mode="default")
-        vae_loss_fn = torch.compile(vae_loss_fn, backend="inductor", mode="default")
+        ae = torch.compile(ae, backend="inductor", mode="default")
+        ae_loss_fn = torch.compile(ae_loss_fn, backend="inductor", mode="default")
 
-    model, vae, vae_loss_fn, optimizer, optimizer_vae, optimizer_loss_fn, train_dataloader = accelerator.prepare(
-        model, vae, vae_loss_fn, optimizer, optimizer_vae, optimizer_loss_fn, train_dataloader
+    model, ae, ae_loss_fn, optimizer, optimizer_ae, optimizer_loss_fn, train_dataloader = accelerator.prepare(
+        model, ae, ae_loss_fn, optimizer, optimizer_ae, optimizer_loss_fn, train_dataloader
     )
 
     if accelerator.is_main_process:
@@ -344,43 +357,86 @@ def main(args):
             # extract the dinov2 features
             with torch.no_grad():
                 zs = []
+                zs_f16 = []  # Keep original 16x16 resolution for encoder/decoder alignment
                 with accelerator.autocast():
                     for encoder, encoder_type, arch in zip(encoders, encoder_types, architectures):
                         raw_image_ = preprocess_raw_image(raw_image, encoder_type)
                         z = encoder.forward_features(raw_image_)
                         if 'mocov3' in encoder_type: z = z = z[:, 1:] 
                         if 'dinov2' in encoder_type: z = z['x_norm_patchtokens']
-                        zs.append(z)
+                        
+                        # For f=32 autoencoder, downsample DINO features from 16x16 to 8x8
+                        # to match the latent resolution for main REPA loss
+                        if args.vae == "f32d256":
+                            # z shape: [B, 256, 768] (16*16=256 tokens)
+                            # Need to downsample to [B, 64, 768] (8*8=64 tokens)
+                            bsz, n_tokens, feat_dim = z.shape
+                            h = w = int(n_tokens ** 0.5)  # 16
+                            z_reshaped = z.reshape(bsz, h, w, feat_dim).permute(0, 3, 1, 2)  # [B, 768, 16, 16]
+                            z_downsampled = torch.nn.functional.avg_pool2d(z_reshaped, kernel_size=2, stride=2)  # [B, 768, 8, 8]
+                            z_downsampled = z_downsampled.permute(0, 2, 3, 1).reshape(bsz, -1, feat_dim)  # [B, 64, 768]
+                            
+                            zs_f16.append(z)  # Keep original 16x16 for encoder/decoder alignment
+                            zs.append(z_downsampled)  # Use 8x8 for main REPA loss
+                        else:
+                            # For other VAEs, use original resolution
+                            zs.append(z)
+                            zs_f16.append(z)
 
-            vae.train()
+            ae.train()
             model.train()
-            with accelerator.accumulate([model, vae, vae_loss_fn]), accelerator.autocast():
-                # 1). Forward pass: VAE
+            with accelerator.accumulate([model, ae, ae_loss_fn]), accelerator.autocast():
+                # 1). Forward pass: Autoencoder
                 processed_image = preprocess_imgs_vae(raw_image)
-                posterior, z, recon_image = vae(processed_image)
+                
+                # For VAE: get posterior, sample z, and reconstruct
+                # For MeiKai AE: get z and align_proj from encoder, decode with decoder
+                if use_vae:
+                    posterior, z, recon_image = ae(processed_image)
+                    encoder_align_proj = None  # VAE doesn't have encoder alignment
+                    decoder_align_proj = None
+                else:
+                    # MeiKai autoencoder: both encoder and decoder return alignment projections
+                    z, encoder_align_proj = ae.encoder(processed_image)
+                    recon_image, decoder_align_proj = ae.decoder(z)
+                    # Create a dummy posterior for compatibility with loss function
+                    from models.invae import DiagonalGaussianDistribution
+                    posterior = DiagonalGaussianDistribution(
+                        torch.cat([z, torch.zeros_like(z)], dim=1),
+                        deterministic=True
+                    )
 
-                # 2). Backward pass: VAE, compute the VAE loss, backpropagate, and update the VAE; Then, compute the discriminator loss and update the discriminator
-                #    loss_kwargs used for SiT forward function, create here and can be reused for both VAE and SiT
+                # 2). Backward pass: AE/VAE, compute the loss, backpropagate, and update the AE/VAE; Then, compute the discriminator loss and update the discriminator
+                #    loss_kwargs used for SiT forward function, create here and can be reused for both AE/VAE and SiT
                 loss_kwargs = dict(
                     path_type=args.path_type,
                     prediction=args.prediction,
                     weighting=args.weighting,
                 )
-                # Record the time_input and noises for the VAE alignment, so that we avoid sampling again
+                # Record the time_input and noises for the alignment, so that we avoid sampling again
                 time_input = None
                 noises = None
 
                 # Turn off grads for the SiT model (avoid REPA gradient on the SiT model)
                 requires_grad(model, False)
-                # Avoid BN stats to be updated by the VAE
+                # Avoid BN stats to be updated by the AE/VAE
                 model.eval()
 
-                vae_loss, vae_loss_dict = vae_loss_fn(processed_image, recon_image, posterior, global_step, "generator")
-                vae_loss = vae_loss.mean()
+                ae_loss, ae_loss_dict = ae_loss_fn(processed_image, recon_image, posterior, global_step, "generator")
+                ae_loss = ae_loss.mean()
 
-                # Compute the REPA alignment loss for VAE updates
+                # Compute the REPA alignment loss for AE/VAE updates
                 loss_kwargs["align_only"] = True
-                vae_align_outputs = model(
+                
+                # For MeiKai AE: 
+                # 1. Main REPA loss: Align f=32 latents (8x8) through diffusion model
+                # 2. Direct encoder alignment: Align encoder's f=16 features (16x16) directly with DINO
+                # 3. Direct decoder alignment: Align decoder's f=16 features (16x16) directly with DINO
+                #
+                # For VAE: Only main REPA loss (align latents through diffusion model)
+                
+                # Main REPA alignment loss (latents through diffusion model)
+                ae_align_outputs = model(
                     x=z,
                     y=labels,
                     zs=zs,
@@ -388,23 +444,39 @@ def main(args):
                     time_input=time_input,
                     noises=noises,
                 )
-                vae_loss = vae_loss + args.vae_align_proj_coeff * vae_align_outputs["proj_loss"].mean()
-                # Save the `time_input` and `noises` and reuse them for the SiT model forward pass
-                time_input = vae_align_outputs["time_input"]
-                noises = vae_align_outputs["noises"]
+                ae_loss = ae_loss + args.vae_align_proj_coeff * ae_align_outputs["proj_loss"].mean()
+                
+                # Save the `time_input` and `noises` for reuse in SiT forward pass
+                time_input = ae_align_outputs["time_input"]
+                noises = ae_align_outputs["noises"]
+                
+                if not use_vae:
+                    # Additional direct alignment losses for encoder and decoder features at f=16
+                    # These don't go through the diffusion model, just direct cosine similarity
+                    # Use zs_f16 which has the original 16x16 resolution
+                    
+                    # Encoder alignment: Compare encoder_align_proj (16x16) with DINO features
+                    # Wrap in list to match the expected signature
+                    encoder_proj_loss = compute_alignment_loss([encoder_align_proj], zs_f16)
+                    ae_loss = ae_loss + args.encoder_align_proj_coeff * encoder_proj_loss
+                    
+                    # Decoder alignment: Compare decoder_align_proj (16x16) with DINO features
+                    # Wrap in list to match the expected signature
+                    decoder_proj_loss = compute_alignment_loss([decoder_align_proj], zs_f16)
+                    ae_loss = ae_loss + args.decoder_align_proj_coeff * decoder_proj_loss
 
-                accelerator.backward(vae_loss)
+                accelerator.backward(ae_loss)
                 if accelerator.sync_gradients:
-                    grad_norm_vae = accelerator.clip_grad_norm_(vae.parameters(), args.max_grad_norm)
-                optimizer_vae.step()
-                optimizer_vae.zero_grad(set_to_none=True)
+                    grad_norm_ae = accelerator.clip_grad_norm_(ae.parameters(), args.max_grad_norm)
+                optimizer_ae.step()
+                optimizer_ae.zero_grad(set_to_none=True)
 
                 # discriminator loss and update
-                d_loss, d_loss_dict = vae_loss_fn(processed_image, recon_image, posterior, global_step, "discriminator")
+                d_loss, d_loss_dict = ae_loss_fn(processed_image, recon_image, posterior, global_step, "discriminator")
                 d_loss = d_loss.mean()
                 accelerator.backward(d_loss)
                 if accelerator.sync_gradients:
-                    grad_norm_disc = accelerator.clip_grad_norm_(vae_loss_fn.parameters(), args.max_grad_norm)
+                    grad_norm_disc = accelerator.clip_grad_norm_(ae_loss_fn.parameters(), args.max_grad_norm)
                 optimizer_loss_fn.step()
                 optimizer_loss_fn.zero_grad(set_to_none=True)
 
@@ -450,44 +522,52 @@ def main(args):
                     "proj_loss": accelerator.gather(sit_outputs["proj_loss"]).mean().detach().item(),
                     "grad_norm_sit": accelerator.gather(grad_norm_sit).mean().detach().item(),
                     "epoch": epoch,
-                    "vae_loss": accelerator.gather(vae_loss).mean().detach().item(),
-                    "reconstruction_loss": accelerator.gather(vae_loss_dict["reconstruction_loss"].mean()).mean().detach().item(),
-                    "perceptual_loss": accelerator.gather(vae_loss_dict["perceptual_loss"].mean()).mean().detach().item(),
-                    "kl_loss": accelerator.gather(vae_loss_dict["kl_loss"].mean()).mean().detach().item(),
-                    "weighted_gan_loss": accelerator.gather(vae_loss_dict["weighted_gan_loss"].mean()).mean().detach().item(),
-                    "discriminator_factor": accelerator.gather(vae_loss_dict["discriminator_factor"].mean()).mean().detach().item(),
-                    "gan_loss": accelerator.gather(vae_loss_dict["gan_loss"].mean()).mean().detach().item(),
-                    "d_weight": accelerator.gather(vae_loss_dict["d_weight"].mean()).mean().detach().item(),
-                    "grad_norm_vae": accelerator.gather(grad_norm_vae).mean().detach().item(),
-                    "vae_align_loss": accelerator.gather(vae_align_outputs["proj_loss"].mean()).mean().detach().item(),
+                    "ae_loss": accelerator.gather(ae_loss).mean().detach().item(),
+                    "reconstruction_loss": accelerator.gather(ae_loss_dict["reconstruction_loss"].mean()).mean().detach().item(),
+                    "perceptual_loss": accelerator.gather(ae_loss_dict["perceptual_loss"].mean()).mean().detach().item(),
+                    "kl_loss": accelerator.gather(ae_loss_dict["kl_loss"].mean()).mean().detach().item(),
+                    "weighted_gan_loss": accelerator.gather(ae_loss_dict["weighted_gan_loss"].mean()).mean().detach().item(),
+                    "discriminator_factor": accelerator.gather(ae_loss_dict["discriminator_factor"].mean()).mean().detach().item(),
+                    "gan_loss": accelerator.gather(ae_loss_dict["gan_loss"].mean()).mean().detach().item(),
+                    "d_weight": accelerator.gather(ae_loss_dict["d_weight"].mean()).mean().detach().item(),
+                    "grad_norm_ae": accelerator.gather(grad_norm_ae).mean().detach().item(),
                     "d_loss": accelerator.gather(d_loss).mean().detach().item(),
                     "grad_norm_disc": accelerator.gather(grad_norm_disc).mean().detach().item(),
                     "logits_real": accelerator.gather(d_loss_dict["logits_real"].mean()).mean().detach().item(),
                     "logits_fake": accelerator.gather(d_loss_dict["logits_fake"].mean()).mean().detach().item(),
                     "lecam_loss": accelerator.gather(d_loss_dict["lecam_loss"].mean()).mean().detach().item(),
                 }
+                
+                # Add alignment-specific logs
+                if not use_vae:
+                    logs["ae_align_loss"] = accelerator.gather(ae_align_outputs["proj_loss"].mean()).mean().detach().item()
+                    logs["encoder_align_loss"] = accelerator.gather(encoder_proj_loss).mean().detach().item()
+                    logs["decoder_align_loss"] = accelerator.gather(decoder_proj_loss).mean().detach().item()
+                else:
+                    logs["vae_align_loss"] = accelerator.gather(ae_align_outputs["proj_loss"].mean()).mean().detach().item()
+                
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 
             if global_step % args.checkpointing_steps == 0 and global_step > 0:
                 if accelerator.is_main_process:
-                    # `model` and `vae` are wrapped by the `accelerator` object, so we need to unwrap them
+                    # `model` and `ae` are wrapped by the `accelerator` object, so we need to unwrap them
                     unwrapped_model = accelerator.unwrap_model(model)
-                    unwrapped_vae = accelerator.unwrap_model(vae)
-                    unwrapped_vae_loss_fn = accelerator.unwrap_model(vae_loss_fn)
+                    unwrapped_ae = accelerator.unwrap_model(ae)
+                    unwrapped_ae_loss_fn = accelerator.unwrap_model(ae_loss_fn)
 
                     # model might be compiled, we extract the original model
                     original_model = unwrapped_model._orig_mod if args.compile else unwrapped_model
-                    original_vae = unwrapped_vae._orig_mod if args.compile else unwrapped_vae
-                    original_discriminator = unwrapped_vae_loss_fn._orig_mod.discriminator if args.compile else unwrapped_vae_loss_fn.discriminator
+                    original_ae = unwrapped_ae._orig_mod if args.compile else unwrapped_ae
+                    original_discriminator = unwrapped_ae_loss_fn._orig_mod.discriminator if args.compile else unwrapped_ae_loss_fn.discriminator
 
                     checkpoint = {
                         "model": original_model.state_dict(),
                         "ema": ema.state_dict(),
-                        "vae": original_vae.state_dict(),
+                        "ae": original_ae.state_dict(),
                         "discriminator": original_discriminator.state_dict(),
                         "opt": optimizer.state_dict(),
-                        "opt_vae": optimizer_vae.state_dict(),
+                        "opt_ae": optimizer_ae.state_dict(),
                         "opt_disc": optimizer_loss_fn.state_dict(),
                         "args": args,
                         "steps": global_step,
@@ -499,7 +579,7 @@ def main(args):
             if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)):
                 # NOTE: Inference should use eval mode
                 model.eval()
-                vae.eval()
+                ae.eval()
                 with torch.no_grad():
                     unwrapped_model = accelerator.unwrap_model(model)
                     samples = euler_sampler(
@@ -517,10 +597,19 @@ def main(args):
                     # reshape latents_stats to [1, C, 1, 1]
                     latents_scale = latents_stats['latents_scale'].view(1, in_channels, 1, 1)
                     latents_bias = latents_stats['latents_bias'].view(1, in_channels, 1, 1)
-                    samples = accelerator.unwrap_model(vae).decode(
-                        denormalize_latents(samples, latents_scale, latents_bias)).sample
-                    samples = (samples + 1) / 2.
-                out_samples = accelerator.gather(samples.to(torch.float32))
+                    
+                    # Decode using the appropriate method
+                    unwrapped_ae = accelerator.unwrap_model(ae)
+                    if use_vae:
+                        decoded_samples = unwrapped_ae.decode(
+                            denormalize_latents(samples, latents_scale, latents_bias)).sample
+                    else:
+                        # For MeiKai autoencoder, use decoder directly
+                        decoded_samples, _ = unwrapped_ae.decoder(
+                            denormalize_latents(samples, latents_scale, latents_bias))
+                    
+                    decoded_samples = (decoded_samples + 1) / 2.
+                out_samples = accelerator.gather(decoded_samples.to(torch.float32))
                 accelerator.log({"samples": wandb.Image(array2grid(out_samples))})
                 logging.info("Generating EMA samples done.")
 
@@ -601,7 +690,7 @@ def parse_args(input_args=None):
                         help="Loss weihgting, uniform or lognormal")
 
     # vae params
-    parser.add_argument("--vae", type=str, default="f8d4", choices=["f8d4", "f16d32"])
+    parser.add_argument("--vae", type=str, default="f8d4", choices=["f8d4", "f16d32", "f32d256"])
     parser.add_argument("--vae-ckpt", type=str, default="pretrained/sdvae-f8d4/sdvae-f8d4.pt")
 
     # vae loss params
@@ -611,7 +700,12 @@ def parse_args(input_args=None):
     # vae training params
     parser.add_argument("--vae-learning-rate", type=float, default=1e-4)
     parser.add_argument("--disc-learning-rate", type=float, default=1e-4)
-    parser.add_argument("--vae-align-proj-coeff", type=float, default=1.5)
+    parser.add_argument("--vae-align-proj-coeff", type=float, default=1.5, 
+                        help="Alignment coefficient for main REPA loss (latents through diffusion model)")
+    parser.add_argument("--encoder-align-proj-coeff", type=float, default=0.5,
+                        help="Direct alignment coefficient for encoder features at f=16 (MeiKai autoencoder only)")
+    parser.add_argument("--decoder-align-proj-coeff", type=float, default=0.5,
+                        help="Direct alignment coefficient for decoder features at f=16 (MeiKai autoencoder only)")
 
     if input_args is not None:
         args = parser.parse_args(input_args)

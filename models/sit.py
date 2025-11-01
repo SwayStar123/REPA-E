@@ -11,6 +11,7 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from loss.losses import compute_alignment_loss
 
 
 def mean_flat(x):
@@ -369,14 +370,8 @@ class SiT(nn.Module):
         # loss computation
         denoising_loss = None if loss_kwargs["align_only"] else mean_flat((x - model_target) ** 2)
 
-        proj_loss = torch.tensor(0., device=x.device)
-        bsz = zs[0].shape[0]
-        for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
-            for z_j, z_tilde_j in zip(z, z_tilde):
-                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1) 
-                z_j = torch.nn.functional.normalize(z_j, dim=-1) 
-                proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
-        proj_loss /= (len(zs) * bsz)
+        # Compute alignment loss: zs_tilde (predictions) are paired with zs (targets)
+        proj_loss = compute_alignment_loss(zs_tilde, zs)
 
         return {
             "zs_tilde": zs_tilde,

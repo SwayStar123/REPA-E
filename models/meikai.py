@@ -33,7 +33,7 @@ class DownsampleBlock(nn.Module):
             *[Block(hidden_dim, hidden_dim) for _ in range(num_blocks)]
         )
     def forward(self, x):
-        # x = self.pool(x)
+        x = self.pool(x)
         x = self.conv(x)
         x = self.blocks(x)
         return x
@@ -85,7 +85,7 @@ class Unpatchify(nn.Module):
         return self.conv(x)
 
 class Encoder(nn.Module):
-    def __init__(self, latent_channels=4, hidden_dim=64, num_downsample_blocks=3, num_blocks_per_downsample=3, patch_size=16):
+    def __init__(self, latent_channels=4, hidden_dim=64, num_downsample_blocks=3, num_blocks_per_downsample=3, patch_size=16, align_at_block=None):
         super().__init__()
         hd = hidden_dim
         self.inp = nn.Sequential(*[
@@ -94,24 +94,38 @@ class Encoder(nn.Module):
         ])
 
         self.alignment_proj = build_mlp(hidden_dim, 768)
+        
+        # If align_at_block is specified, we'll extract features at that specific downsample block
+        self.align_at_block = align_at_block if align_at_block is not None else 0
 
-        self.down_blocks = nn.Sequential(*[
+        self.down_blocks = nn.ModuleList([
             DownsampleBlock(hd, num_blocks_per_downsample) for _ in range(num_downsample_blocks)
         ])
 
         self.out = conv(hd, latent_channels)
+        
     def forward(self, x):
         x = self.inp(x)
 
-        align_proj = self.alignment_proj(x.permute(0, 2, 3, 1))
+        # Extract alignment features at the specified block
+        align_features = None
+        for i, block in enumerate(self.down_blocks):
+            x = block(x)
+            if i == self.align_at_block:
+                align_features = x
         
-        x = self.down_blocks(x)
+        # If no specific block is set, use the input features (before downsampling)
+        if align_features is None:
+            align_features = x
+            
+        align_proj = self.alignment_proj(align_features.permute(0, 2, 3, 1))
+        
         x = self.out(x)
 
         return x, align_proj
 
 class Decoder(nn.Module):
-    def __init__(self, latent_channels=4, hidden_dim=64, num_upsample_blocks=3, num_blocks_per_upsample=3, patch_size=16):
+    def __init__(self, latent_channels=4, hidden_dim=64, num_upsample_blocks=3, num_blocks_per_upsample=3, patch_size=16, align_at_block=None):
         super().__init__()
         hd = hidden_dim
         self.inp = nn.Sequential(*[
@@ -120,7 +134,10 @@ class Decoder(nn.Module):
             nn.ReLU(),
         ])
 
-        self.up_blocks = nn.Sequential(*[
+        # If align_at_block is specified, we'll extract features at that specific upsample block
+        self.align_at_block = align_at_block if align_at_block is not None else 0
+
+        self.up_blocks = nn.ModuleList([
             UpsampleBlock(hd, num_blocks_per_upsample) for _ in range(num_upsample_blocks)
         ])
 
@@ -133,19 +150,53 @@ class Decoder(nn.Module):
 
     def forward(self, z):
         z = self.inp(z)
-        z = self.up_blocks(z)
+        
+        # Extract alignment features at the specified block
+        align_features = None
+        for i, block in enumerate(self.up_blocks):
+            z = block(z)
+            if i == self.align_at_block:
+                align_features = z
 
-        align_proj = self.alignment_layer(z.permute(0, 2, 3, 1))
+        # If no specific block is set, use final features
+        if align_features is None:
+            align_features = z
+
+        align_proj = self.alignment_layer(align_features.permute(0, 2, 3, 1))
 
         z = self.out(z)
 
         return z, align_proj
 
 class MeiKai(nn.Module):
-    def __init__(self, latent_channels=4, hidden_dim=64, num_blocks=3, blocks_per_stage=3, patch_size=8):
+    def __init__(self, latent_channels=4, hidden_dim=64, num_blocks=3, blocks_per_stage=3, patch_size=8, encoder_align_at_block=None, decoder_align_at_block=None):
         super().__init__()
-        self.encoder = Encoder(latent_channels, hidden_dim, num_blocks, blocks_per_stage, patch_size)
-        self.decoder = Decoder(latent_channels, hidden_dim, num_blocks, blocks_per_stage, patch_size)
+        self.encoder = Encoder(latent_channels, hidden_dim, num_blocks, blocks_per_stage, patch_size, encoder_align_at_block)
+        self.decoder = Decoder(latent_channels, hidden_dim, num_blocks, blocks_per_stage, patch_size, decoder_align_at_block)
+
+def AE_F32D256(**kwargs):
+    """
+    Autoencoder with f=32 compression factor (256x256 -> 8x8 latents).
+    Alignment happens at f=16 (16x16 feature maps) for both encoder and decoder.
+    
+    Architecture:
+    - Encoder: Patchify(4) -> 64x64 -> Downsample -> 32x32 -> Downsample -> 16x16 [ALIGN] -> Downsample -> 8x8
+    - Decoder: 8x8 -> Upsample -> 16x16 [ALIGN] -> Upsample -> 32x32 -> Upsample -> 64x64 -> Unpatchify(4) -> 256x256
+    
+    For num_blocks=3 with patch_size=4:
+    - Encoder aligns at downsample block 1 (after 2nd downsample, 16x16 resolution)
+    - Decoder aligns at upsample block 0 (after 1st upsample, 16x16 resolution)
+    """
+    return MeiKai(
+        latent_channels=256,
+        hidden_dim=768,
+        num_blocks=3,
+        blocks_per_stage=2,
+        patch_size=4,
+        encoder_align_at_block=1,  # Align at second downsample block (16x16 resolution)
+        decoder_align_at_block=0,  # Align at first upsample block (16x16 resolution)
+        **kwargs
+    )
 
 @torch.no_grad()
 def main():

@@ -35,6 +35,44 @@ def mean_flat(x):
     return torch.mean(x, dim=list(range(1, len(x.size()))))
 
 
+def compute_alignment_loss(zs_tilde, zs):
+    """
+    Compute cosine similarity alignment loss between predicted and target features.
+    
+    This function matches the original REPA alignment loss implementation.
+    
+    Args:
+        zs_tilde: List of predicted feature tensors from the model
+                  Each tensor has shape [B, N, D] where B=batch, N=num_tokens, D=feature_dim
+                  Can also be [B, H, W, D] and will be reshaped to [B, N, D]
+        zs: List of target feature tensors (e.g., from DINO)
+            Each tensor has shape [B, N, D]
+            Must have same length as zs_tilde (they are zipped together)
+    
+    Returns:
+        Scalar loss value (negative cosine similarity, averaged over all pairs)
+    """
+    proj_loss = torch.tensor(0., device=zs_tilde[0].device)
+    bsz = zs[0].shape[0]
+    
+    # Iterate over paired predictions and targets
+    for z, z_tilde in zip(zs, zs_tilde):
+        # Reshape z_tilde if needed (e.g., from [B, H, W, D] to [B, N, D])
+        if len(z_tilde.shape) == 4:
+            b, h, w, d = z_tilde.shape
+            z_tilde = z_tilde.reshape(b, -1, d)
+        
+        # Iterate over batch elements
+        for z_j, z_tilde_j in zip(z, z_tilde):
+            z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1)
+            z_j = torch.nn.functional.normalize(z_j, dim=-1)
+            proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
+    
+    proj_loss /= (len(zs) * bsz)
+    
+    return proj_loss
+
+
 def hinge_d_loss(logits_real: torch.Tensor, logits_fake: torch.Tensor) -> torch.Tensor:
     """Hinge loss for discrminator.
 
@@ -412,14 +450,8 @@ class ReconstructionLoss_Single_Stage(ReconstructionLoss_Stage2):
         zs_tilde = extra_result_dict["zs_tilde"]  # list of [B, N, C]
         zs = extra_result_dict["zs"]              # list of [B, N, C]
 
-        proj_loss = torch.tensor(0., device=inputs.device)
-        bsz = zs[0].shape[0]
-        for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
-            for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde)):
-                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1) 
-                z_j = torch.nn.functional.normalize(z_j, dim=-1) 
-                proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
-        proj_loss /= (len(zs) * bsz)
+        # Compute alignment loss: zs_tilde (predictions) are paired with zs (targets)
+        proj_loss = compute_alignment_loss(zs_tilde, zs)
 
         if self.quantize_mode == "vq":
             # Compute quantizer loss.
