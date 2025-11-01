@@ -18,6 +18,7 @@ from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 from omegaconf import OmegaConf
 import wandb
+from PIL import Image
 
 from dataset import CustomINH5Dataset, CustomDirDataset
 from loss.losses import ReconstructionLoss_Single_Stage, compute_alignment_loss
@@ -142,6 +143,8 @@ def main(args):
         os.makedirs(args.output_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         save_dir = os.path.join(args.output_dir, args.exp_name)
         os.makedirs(save_dir, exist_ok=True)
+        sample_dir = os.path.join(save_dir, "samples")
+        os.makedirs(sample_dir, exist_ok=True)
         args_dict = vars(args)
         # Save to a JSON file
         json_dir = os.path.join(save_dir, "args.json")
@@ -610,7 +613,13 @@ def main(args):
                     
                     decoded_samples = (decoded_samples + 1) / 2.
                 out_samples = accelerator.gather(decoded_samples.to(torch.float32))
-                accelerator.log({"samples": wandb.Image(array2grid(out_samples))})
+                if accelerator.is_main_process:
+                    grid = array2grid(out_samples)
+                    Image.fromarray(grid).save(f"{sample_dir}/samples_step_{global_step}.png")
+                    logger.info(f"Saved samples at step {global_step}")
+                    if global_step % 50000 == 0:
+                        accelerator.log({"samples": wandb.Image(array2grid(out_samples))})
+                
                 logging.info("Generating EMA samples done.")
 
             if global_step >= args.max_train_steps:
