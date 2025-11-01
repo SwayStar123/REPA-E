@@ -19,9 +19,9 @@ from tqdm.auto import tqdm
 from omegaconf import OmegaConf
 import wandb
 
-from dataset import CustomINH5Dataset
+from dataset import CustomINH5Dataset, CustomDirDataset
 from loss.losses import ReconstructionLoss_Single_Stage
-from models.autoencoder import vae_models
+from models.invae import vae_models
 from models.sit import SiT_models
 from samplers import euler_sampler
 from utils import load_encoders, normalize_latents, denormalize_latents, preprocess_imgs_vae, count_trainable_params
@@ -246,7 +246,12 @@ def main(args):
     )
 
     # Setup data
-    train_dataset = CustomINH5Dataset(args.data_dir)
+    if args.dataset_type == "h5":
+        train_dataset = CustomINH5Dataset(args.data_dir)
+    elif args.dataset_type == "dir":
+        train_dataset = CustomDirDataset(args.data_dir)
+    else:
+        raise ValueError(f"Unknown dataset type: {args.dataset_type}")
     local_batch_size = int(args.batch_size // accelerator.num_processes)
     train_dataloader = DataLoader(
         train_dataset,
@@ -561,6 +566,8 @@ def parse_args(input_args=None):
 
     # dataset params
     parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--dataset-type", type=str, default="dir", choices=["h5", "dir"],
+                        help="Dataset type: 'h5' for H5 files, 'dir' for directory structure")
     parser.add_argument("--resolution", type=int, choices=[256], default=256)
     parser.add_argument("--batch-size", type=int, default=256)
 

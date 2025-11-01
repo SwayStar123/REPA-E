@@ -27,7 +27,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from models.sit import SiT_models
-from models.autoencoder import vae_models
+from models.invae import vae_models
 from samplers import euler_sampler, euler_maruyama_sampler
 from utils import load_encoders, denormalize_latents
 

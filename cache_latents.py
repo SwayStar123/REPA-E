@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import CustomINH5Dataset, load_h5_file
-from models.autoencoder import vae_models
+from models.invae import vae_models
 from utils import preprocess_imgs_vae
 
 
