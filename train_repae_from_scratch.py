@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 from collections import OrderedDict
+import random
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -119,6 +120,31 @@ def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
 
+def generate_channel_mask(batch_size, total_channels, device, channel_choices=None):
+    """Generate random channel-wise mask for structured latent space training.
+    
+    Args:
+        batch_size: Number of samples in batch
+        total_channels: Total number of latent channels (c)
+        device: Device to create mask on
+        channel_choices: List of possible channel numbers to sample from
+                        If None, uses [16, 17, 18, ..., total_channels]
+    
+    Returns:
+        mask: Shape [batch_size, channels, 1, 1]
+    """
+    if channel_choices is None:
+        # Default: sample from [16, 17, 18, ..., c]
+        channel_choices = list(range(16, total_channels + 1))
+    
+    # Randomly select number of channels to keep for this batch
+    num_channels_to_keep = random.choice(channel_choices)
+    
+    # Create mask: [1, 1, ..., 1, 0, 0, ..., 0]
+    mask = torch.zeros(batch_size, total_channels, 1, 1, device=device)
+    mask[:, :num_channels_to_keep, :, :] = 1.0
+    
+    return mask
 
 #################################################################################
 #                                  Training Loop                                #
@@ -394,14 +420,21 @@ def main(args):
                 
                 # For VAE: get posterior, sample z, and reconstruct
                 # For MeiKai AE: get z and align_proj from encoder, decode with decoder
+                channel_mask = None
                 if use_vae:
                     posterior, z, recon_image = ae(processed_image)
                     encoder_align_proj = None  # VAE doesn't have encoder alignment
                     decoder_align_proj = None
+                    channel_mask = torch.ones_like(z)
                 else:
                     # MeiKai autoencoder: both encoder and decoder return alignment projections
                     z, encoder_align_proj = ae.encoder(processed_image)
-                    recon_image, decoder_align_proj = ae.decoder(z)
+
+                    channel_mask = generate_channel_mask(z.shape[0], z.shape[1], device)
+                    if not args.use_structured_latent:
+                        channel_mask = torch.ones_like(channel_mask)
+
+                    recon_image, decoder_align_proj = ae.decoder(z * channel_mask)
                     # Create a dummy posterior for compatibility with loss function
                     from models.invae import DiagonalGaussianDistribution
                     posterior = DiagonalGaussianDistribution(
@@ -446,6 +479,7 @@ def main(args):
                     loss_kwargs=loss_kwargs,
                     time_input=time_input,
                     noises=noises,
+                    channel_mask=channel_mask,
                 )
                 ae_loss = ae_loss + args.vae_align_proj_coeff * ae_align_outputs["proj_loss"].mean()
                 
@@ -498,10 +532,12 @@ def main(args):
                     loss_kwargs=loss_kwargs,
                     time_input=time_input,
                     noises=noises,
+                    channel_mask=channel_mask,
                 )
 
                 # 4). Compute diffusion loss and REPA alignment loss, backpropagate the SiT loss, and update the model
                 sit_loss = sit_outputs["denoising_loss"].mean() + args.proj_coeff * sit_outputs["proj_loss"].mean()
+
                 accelerator.backward(sit_loss)
                 if accelerator.sync_gradients:
                     grad_norm_sit = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -715,6 +751,8 @@ def parse_args(input_args=None):
                         help="Direct alignment coefficient for encoder features at f=16 (MeiKai autoencoder only)")
     parser.add_argument("--decoder-align-proj-coeff", type=float, default=0.5,
                         help="Direct alignment coefficient for decoder features at f=16 (MeiKai autoencoder only)")
+    parser.add_argument("--use-structured-latent", action=argparse.BooleanOptionalAction, default=True,
+                    help="Use structured latent space with channel-wise masking during AE training")
 
     if input_args is not None:
         args = parser.parse_args(input_args)

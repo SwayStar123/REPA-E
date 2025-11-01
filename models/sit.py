@@ -304,7 +304,7 @@ class SiT(nn.Module):
 
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
 
-    def forward(self, x, y, zs, loss_kwargs, time_input=None, noises=None):
+    def forward(self, x, y, zs, loss_kwargs, time_input=None, noises=None, channel_mask=None):
         """
         Forward pass of SiT, integrating the loss function computation
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images UNNORMALIZED)
@@ -340,6 +340,10 @@ class SiT(nn.Module):
         else:
             noises = noises.to(device=normalized_x.device, dtype=normalized_x.dtype)
 
+        if channel_mask is not None:
+            normalized_x = normalized_x * channel_mask
+            noises = noises * channel_mask
+
         # compute interpolant
         alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(time_input, path_type=loss_kwargs["path_type"])
 
@@ -368,7 +372,10 @@ class SiT(nn.Module):
         x = self.unpatchify(x)                                # (N, out_channels, H, W)
 
         # loss computation
-        denoising_loss = None if loss_kwargs["align_only"] else mean_flat((x - model_target) ** 2)
+        denoising_loss = None if loss_kwargs["align_only"] else ((x - model_target) ** 2)
+
+        if channel_mask is not None:
+            denoising_loss = denoising_loss * channel_mask
 
         # Compute alignment loss: zs_tilde (predictions) are paired with zs (targets)
         proj_loss = compute_alignment_loss(zs_tilde, zs)
