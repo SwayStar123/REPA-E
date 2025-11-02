@@ -334,6 +334,21 @@ class SiT(nn.Module):
                 raise NotImplementedError(f"Weighting scheme {loss_kwargs['weighting']} not implemented.")
         time_input = time_input.to(device=normalized_x.device, dtype=normalized_x.dtype)
 
+        # Apply time shifting
+        if loss_kwargs["apply_time_shift"]:
+            # Compute shift parameters
+            # m = effective data dimension (flattened latent size)
+            shift_dim = normalized_x.shape[1] * normalized_x.shape[2] * normalized_x.shape[3]  # C * H * W
+            # n = base dimension (typically 4096)
+            shift_base = 4096
+            # alpha = sqrt(m/n)
+            alpha = math.sqrt(shift_dim / shift_base)
+            
+            # Apply shift formula: t_m = (alpha * t_n) / (1 + (alpha - 1) * t_n)
+            time_input = (alpha * time_input) / (1 + (alpha - 1) * time_input)
+            # Clamp to [0, 1] to handle numerical issues
+            time_input = torch.clamp(time_input, 0, 1)
+
         # sample noises if not provided
         if noises is None:
             noises = torch.randn_like(normalized_x)

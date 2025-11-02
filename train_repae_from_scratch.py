@@ -448,6 +448,7 @@ def main(args):
                     path_type=args.path_type,
                     prediction=args.prediction,
                     weighting=args.weighting,
+                    apply_time_shift=args.apply_time_shift,
                 )
                 # Record the time_input and noises for the alignment, so that we avoid sampling again
                 time_input = None
@@ -631,6 +632,7 @@ def main(args):
                         guidance_high=1.,
                         path_type=args.path_type,
                         heun=False,
+                        time_shifting=args.apply_time_shift,
                     ).to(torch.float32)
                     latents_stats = unwrapped_model.extract_latents_stats()
                     # reshape latents_stats to [1, C, 1, 1]
@@ -733,6 +735,8 @@ def parse_args(input_args=None):
     parser.add_argument("--proj-coeff", type=float, default=0.5)
     parser.add_argument("--weighting", default="uniform", type=str, choices=["uniform", "lognormal"],
                         help="Loss weihgting, uniform or lognormal")
+    parser.add_argument("--apply-time-shift", action=argparse.BooleanOptionalAction, default=True,
+                        help="Apply time shifting (Esser et al. 2024)")
 
     # vae params
     parser.add_argument("--vae", type=str, default="f8d4", choices=["f8d4", "f16d32", "f32d256"])

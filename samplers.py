@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import math
 
 
 def expand_t_like_x(t, x_cur):
@@ -44,6 +45,33 @@ def compute_diffusion(t_cur):
     return 2 * t_cur
 
 
+def apply_time_shift(t, shift_dim, shift_base=4096):
+    """
+    Apply Esser et al. (2024) time shifting formula.
+    
+    Args:
+        t: timesteps tensor or array
+        shift_dim: effective data dimension (C * H * W for latents)
+        shift_base: base dimension (typically 4096)
+    
+    Returns:
+        shifted timesteps
+    """
+    # Calculate shift factor: alpha = sqrt(m/n)
+    shift = math.sqrt(shift_dim / shift_base)
+    
+    # Apply shift formula: t_shifted = (shift * t) / (1 + (shift - 1) * t)
+    t_shifted = (shift * t) / (1 + (shift - 1) * t)
+    
+    # Clamp to valid range [0, 1]
+    if isinstance(t_shifted, torch.Tensor):
+        t_shifted = torch.clamp(t_shifted, 0, 1)
+    else:
+        t_shifted = np.clip(t_shifted, 0, 1)
+    
+    return t_shifted
+
+
 def euler_sampler(
         model,
         latents,
@@ -53,13 +81,22 @@ def euler_sampler(
         cfg_scale=1.0,
         guidance_low=0.0,
         guidance_high=1.0,
-        path_type="linear", # not used, just for compatability
+        path_type="linear",
+        time_shifting=True,
+        shift_base=4096,
     ):
     # setup conditioning
     if cfg_scale > 1.0:
         y_null = torch.tensor([1000] * y.size(0), device=y.device)
     _dtype = latents.dtype    
     t_steps = torch.linspace(1, 0, num_steps+1, dtype=torch.float64)
+    
+    # Apply time shifting if enabled
+    if time_shifting:
+        # Calculate effective latent dimension
+        shift_dim = latents.shape[1] * latents.shape[2] * latents.shape[3]  # C * H * W
+        t_steps = apply_time_shift(t_steps, shift_dim, shift_base)
+    
     x_next = latents.to(torch.float64)
     device = x_next.device
 
@@ -113,6 +150,8 @@ def euler_maruyama_sampler(
         guidance_low=0.0,
         guidance_high=1.0,
         path_type="linear",
+        time_shifting=True,
+        shift_base=4096,
     ):
     # setup conditioning
     if cfg_scale > 1.0:
@@ -122,6 +161,13 @@ def euler_maruyama_sampler(
     
     t_steps = torch.linspace(1., 0.04, num_steps, dtype=torch.float64)
     t_steps = torch.cat([t_steps, torch.tensor([0.], dtype=torch.float64)])
+    
+    # Apply time shifting if enabled
+    if time_shifting:
+        # Calculate effective latent dimension
+        shift_dim = latents.shape[1] * latents.shape[2] * latents.shape[3]  # C * H * W
+        t_steps = apply_time_shift(t_steps, shift_dim, shift_base)
+    
     x_next = latents.to(torch.float64)
     device = x_next.device
 

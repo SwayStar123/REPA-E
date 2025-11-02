@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 from models.sit import SiT_models
 from models.invae import vae_models
+from models.meikai import AE_F32D256
 from samplers import euler_sampler, euler_maruyama_sampler
 from utils import load_encoders, denormalize_latents
 
@@ -82,6 +83,9 @@ def main(args):
     elif config.vae == "f16d32":
         latent_size = config.resolution // 16
         in_channels = 32
+    elif config.vae == "f32d256":
+        latent_size = config.resolution // 32
+        in_channels = 256
     else:
         raise NotImplementedError()
 
@@ -113,10 +117,18 @@ def main(args):
     model.eval()  # Important! To disable label dropout during sampling
 
     # Load the VAE and latent stats
-    vae = vae_models[config.vae]().to(device)
+    if config.vae == "f32d256":
+        # Use MeiKai autoencoder with f=32 compression
+        vae = AE_F32D256().to(device)
+        use_vae = False  # MeiKai is a deterministic autoencoder, not VAE
+    else:
+        # Use traditional VAE
+        vae = vae_models[config.vae]().to(device)
+        use_vae = True
+    
     if "vae" in state_dict:
         # REPA-E checkpoints, VAE is in the checkpoint
-        vae_state_dict = state_dict['vae']
+        vae_state_dict = state_dict['vae'] if use_vae else state_dict['ae']
 
         latents_scale = state_dict["ema"]["bn.running_var"].rsqrt().view(1, in_channels, 1, 1).to(device)
         latents_bias = state_dict["ema"]["bn.running_mean"].view(1, in_channels, 1, 1).to(device)
@@ -221,6 +233,7 @@ def main(args):
             guidance_low=args.guidance_low,
             guidance_high=args.guidance_high,
             path_type=args.path_type,
+            time_shifting=args.apply_time_shift,
         )
         with torch.no_grad():
             if args.mode == "sde":
@@ -230,7 +243,13 @@ def main(args):
             else:
                 raise NotImplementedError()
 
-            samples = vae.decode(denormalize_latents(samples, latents_scale, latents_bias)).sample
+            # Decode using the appropriate method
+            if use_vae:
+                samples = vae.decode(denormalize_latents(samples, latents_scale, latents_bias)).sample
+            else:
+                # For MeiKai autoencoder, use decoder directly
+                samples, _ = vae.decoder(denormalize_latents(samples, latents_scale, latents_bias))
+            
             samples = (samples + 1) / 2.
             samples = torch.clamp(
                 255. * samples, 0, 255
@@ -281,6 +300,8 @@ if __name__ == "__main__":
                         help="Use Heun's method for ODE sampling.")
     parser.add_argument("--guidance-low", type=float, default=0.)
     parser.add_argument("--guidance-high", type=float, default=1.)
+    parser.add_argument("--apply-time-shift", action=argparse.BooleanOptionalAction, default=True,
+                        help="Apply time shifting (Esser et al. 2024)")
 
     parser.add_argument(
         "--label-sampling",
