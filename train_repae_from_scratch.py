@@ -227,14 +227,25 @@ def main(args):
     ema = copy.deepcopy(model).to(device)  # Create an EMA of the model for use after training
 
     # Create autoencoder
-    if args.vae == "f32d256":
-        # Use MeiKai autoencoder with f=32 compression
-        ae = AE_F32D256().to(device)
-        use_vae = False  # MeiKai is a deterministic autoencoder, not VAE
-    else:
-        # Use traditional VAE
-        ae = vae_models[args.vae]().to(device)
+    # Determine which architecture to use
+    if args.ae_architecture == "auto":
+        # Auto mode: use MeiKai for f32d256, VAE for others
+        use_vae = args.vae != "f32d256"
+    elif args.ae_architecture == "vae":
         use_vae = True
+    elif args.ae_architecture == "meikai":
+        use_vae = False
+    else:
+        raise ValueError(f"Invalid ae_architecture: {args.ae_architecture}")
+    
+    if not use_vae:
+        # Use MeiKai autoencoder (deterministic autoencoder)
+        if args.vae != "f32d256":
+            raise ValueError(f"MeiKai architecture only supports f32d256, but got {args.vae}. Use --vae f32d256 or --ae-architecture vae.")
+        ae = AE_F32D256().to(device)
+    else:
+        # Use traditional VAE from invae.py
+        ae = vae_models[args.vae]().to(device)
     
     requires_grad(ema, False)
     print(f"Total trainable params in {'AE' if not use_vae else 'VAE'}:", count_trainable_params(ae))
@@ -422,10 +433,26 @@ def main(args):
                 # For MeiKai AE: get z and align_proj from encoder, decode with decoder
                 channel_mask = None
                 if use_vae:
-                    posterior, z, recon_image = ae(processed_image)
-                    encoder_align_proj = None  # VAE doesn't have encoder alignment
-                    decoder_align_proj = None
-                    channel_mask = torch.ones_like(z)
+                    # VAE with alignment projections
+                    if ae.module.encoder_align_at_level is not None and ae.module.decoder_align_at_level is not None:
+                        # VAE with alignment support - do encoding and decoding manually to apply channel masking
+                        posterior, encoder_align_proj = ae.module.encode(processed_image, return_align_proj=True)
+                        z = posterior.sample()
+                        
+                        # Apply channel masking for structured latent space (same as MeiKai)
+                        channel_mask = generate_channel_mask(z.shape[0], z.shape[1], device)
+                        if not args.use_structured_latent:
+                            channel_mask = torch.ones_like(channel_mask)
+                        
+                        # Decode with masked latents
+                        recon_dict, decoder_align_proj = ae.module.decode(z * channel_mask, return_align_proj=True)
+                        recon_image = recon_dict.sample
+                    else:
+                        # VAE without alignment support (e.g., f8d4)
+                        posterior, z, recon_image = ae(processed_image, return_align_proj=False)
+                        encoder_align_proj = None
+                        decoder_align_proj = None
+                        channel_mask = torch.ones_like(z)
                 else:
                     # MeiKai autoencoder: both encoder and decoder return alignment projections
                     z, encoder_align_proj = ae.module.encoder(processed_image)
@@ -488,11 +515,11 @@ def main(args):
                 time_input = ae_align_outputs["time_input"]
                 noises = ae_align_outputs["noises"]
                 
-                if not use_vae:
-                    # Additional direct alignment losses for encoder and decoder features at f=16
-                    # These don't go through the diffusion model, just direct cosine similarity
-                    # Use zs_f16 which has the original 16x16 resolution
-                    
+                # Additional direct alignment losses for encoder and decoder features at f=16
+                # These don't go through the diffusion model, just direct cosine similarity
+                # Use zs_f16 which has the original 16x16 resolution
+                # This applies to both VAE (with alignment support) and MeiKai AE
+                if encoder_align_proj is not None and decoder_align_proj is not None:
                     # Encoder alignment: Compare encoder_align_proj (16x16) with DINO features
                     # Wrap in list to match the expected signature
                     encoder_proj_loss = compute_alignment_loss([encoder_align_proj], zs_f16)
@@ -502,6 +529,9 @@ def main(args):
                     # Wrap in list to match the expected signature
                     decoder_proj_loss = compute_alignment_loss([decoder_align_proj], zs_f16)
                     ae_loss = ae_loss + args.decoder_align_proj_coeff * decoder_proj_loss
+                else:
+                    encoder_proj_loss = torch.tensor(0.0, device=device)
+                    decoder_proj_loss = torch.tensor(0.0, device=device)
 
                 accelerator.backward(ae_loss)
                 if accelerator.sync_gradients:
@@ -579,12 +609,12 @@ def main(args):
                 }
                 
                 # Add alignment-specific logs
-                if not use_vae:
+                if encoder_align_proj is not None and decoder_align_proj is not None:
                     logs["ae_align_loss"] = accelerator.gather(ae_align_outputs["proj_loss"].mean()).mean().detach().item()
                     logs["encoder_align_loss"] = accelerator.gather(encoder_proj_loss).mean().detach().item()
                     logs["decoder_align_loss"] = accelerator.gather(decoder_proj_loss).mean().detach().item()
                 else:
-                    logs["vae_align_loss"] = accelerator.gather(ae_align_outputs["proj_loss"].mean()).mean().detach().item()
+                    logs["ae_align_loss"] = accelerator.gather(ae_align_outputs["proj_loss"].mean()).mean().detach().item()
                 
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
@@ -643,7 +673,7 @@ def main(args):
                     unwrapped_ae = accelerator.unwrap_model(ae)
                     if use_vae:
                         decoded_samples = unwrapped_ae.decode(
-                            denormalize_latents(samples, latents_scale, latents_bias)).sample
+                            denormalize_latents(samples, latents_scale, latents_bias), return_align_proj=False).sample
                     else:
                         # For MeiKai autoencoder, use decoder directly
                         decoded_samples, _ = unwrapped_ae.decoder(
@@ -657,6 +687,37 @@ def main(args):
                     logger.info(f"Saved samples at step {global_step}")
                     if global_step % 50000 == 0:
                         accelerator.log({"samples": wandb.Image(array2grid(out_samples))})
+                
+                # Generate and save reconstruction samples
+                with torch.no_grad():
+                    # Get a batch of real images for reconstruction
+                    recon_raw_images = raw_image[:sample_batch_size].to(device)
+                    recon_processed_images = preprocess_imgs_vae(recon_raw_images)
+                    
+                    # Encode and decode through the autoencoder
+                    if use_vae:
+                        posterior_recon, z_recon, recon_images = unwrapped_ae(recon_processed_images, return_align_proj=False)
+                    else:
+                        z_recon, _ = unwrapped_ae.encoder(recon_processed_images)
+                        recon_images, _ = unwrapped_ae.decoder(z_recon)
+                    
+                    # Denormalize reconstructions to [0, 1] range
+                    recon_images = (recon_images + 1) / 2.
+                    recon_raw_images = (recon_processed_images + 1) / 2.
+                    
+                    # Gather across all processes
+                    out_recons = accelerator.gather(recon_images.to(torch.float32))
+                    out_originals = accelerator.gather(recon_raw_images.to(torch.float32))
+                    
+                    if accelerator.is_main_process:
+                        # Create a grid showing original and reconstruction side by side
+                        # Interleave originals and reconstructions
+                        comparison = torch.stack([out_originals, out_recons], dim=1).flatten(0, 1)
+                        recon_grid = array2grid(comparison)
+                        Image.fromarray(recon_grid).save(f"{sample_dir}/reconstructions_step_{global_step}.png")
+                        logger.info(f"Saved reconstruction samples at step {global_step}")
+                        if global_step % 50000 == 0:
+                            accelerator.log({"reconstructions": wandb.Image(recon_grid)})
                 
                 logging.info("Generating EMA samples done.")
 
@@ -681,7 +742,7 @@ def parse_args(input_args=None):
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--logging-dir", type=str, default="logs")
     parser.add_argument("--report-to", type=str, default="wandb")
-    parser.add_argument("--sampling-steps", type=int, default=2000)
+    parser.add_argument("--sampling-steps", type=int, default=500)
     parser.add_argument("--resume-step", type=int, default=0)
     parser.add_argument("--continue-train-exp-dir", type=str, default=None)
     parser.add_argument("--wandb-history-path", type=str, default=None)
@@ -741,6 +802,8 @@ def parse_args(input_args=None):
     # vae params
     parser.add_argument("--vae", type=str, default="f8d4", choices=["f8d4", "f16d32", "f32d256"])
     parser.add_argument("--vae-ckpt", type=str, default="pretrained/sdvae-f8d4/sdvae-f8d4.pt")
+    parser.add_argument("--ae-architecture", type=str, default="vae", choices=["auto", "vae", "meikai"],
+                        help="Choose autoencoder architecture: 'auto' (MeiKai for f32d256, VAE otherwise), 'vae' (invae VAE), 'meikai' (MeiKai AE)")
 
     # vae loss params
     parser.add_argument("--disc-pretrained-ckpt", type=str, default=None)

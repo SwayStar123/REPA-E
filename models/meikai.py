@@ -2,18 +2,22 @@ import torch
 import torch.nn as nn
 
 def build_mlp(hidden_size, z_dim):
-    return nn.Sequential(
+    mlp = nn.Sequential(
             nn.Linear(hidden_size, z_dim),
             nn.SiLU(),
             nn.Linear(z_dim, z_dim),
         )
+    # Initialize final linear layer with small weights for stability
+    nn.init.normal_(mlp[2].weight, std=0.01)
+    nn.init.zeros_(mlp[2].bias)
+    return mlp
 
 def conv(n_in, n_out, **kwargs):
     return nn.Conv2d(n_in, n_out, 3, padding=1, **kwargs)
 
 class Clamp(nn.Module):
     def forward(self, x):
-        return torch.tanh(x / 3) * 3
+        return torch.tanh(x / 6) * 6
 
 class Block(nn.Module):
     def __init__(self, n_in, n_out):
@@ -25,11 +29,11 @@ class Block(nn.Module):
         return self.fuse(self.conv(x) + self.skip(x))
 
 class DownsampleBlock(nn.Module):
-    def __init__(self, hidden_dim=64, num_blocks=3):
+    def __init__(self, in_dim=64, out_dim=64, num_blocks=3):
         super().__init__()
-        self.conv = conv(hidden_dim, hidden_dim, stride=2, bias=False)
+        self.conv = conv(in_dim, out_dim, stride=2, bias=False)
         self.blocks = nn.Sequential(
-            *[Block(hidden_dim, hidden_dim) for _ in range(num_blocks)]
+            *[Block(out_dim, out_dim) for _ in range(num_blocks)]
         )
     def forward(self, x):
         x = self.conv(x)
@@ -37,13 +41,13 @@ class DownsampleBlock(nn.Module):
         return x
 
 class UpsampleBlock(nn.Module):
-    def __init__(self, hidden_dim=64, num_blocks=3):
+    def __init__(self, in_dim=64, out_dim=64, num_blocks=3):
         super().__init__()
         self.blocks = nn.Sequential(
-            *[Block(hidden_dim, hidden_dim) for _ in range(num_blocks)]
+            *[Block(in_dim, in_dim) for _ in range(num_blocks)]
         )
         self.upsample = nn.Upsample(scale_factor=2)
-        self.conv = conv(hidden_dim, hidden_dim, bias=False)
+        self.conv = conv(in_dim, out_dim, bias=False)
     def forward(self, x):
         x = self.blocks(x)
         x = self.upsample(x)
@@ -83,24 +87,31 @@ class Unpatchify(nn.Module):
         return self.conv(x)
 
 class Encoder(nn.Module):
-    def __init__(self, latent_channels=4, hidden_dim=64, num_downsample_blocks=3, num_blocks_per_downsample=3, patch_size=16, align_at_block=None):
+    def __init__(self, latent_channels=4, hidden_dims=[64], num_downsample_blocks=3, num_blocks_per_downsample=3, patch_size=16, align_at_block=None):
         super().__init__()
-        hd = hidden_dim
+        hd = hidden_dims[0]
         self.inp = nn.Sequential(*[
             Patchify(3, hd, patch_size), 
             Block(hd, hd),
         ])
 
-        self.alignment_proj = build_mlp(hidden_dim, 768)
+        self.alignment_proj = build_mlp(hidden_dims[0] if align_at_block == -1 or align_at_block is None else hidden_dims[min(align_at_block + 1, len(hidden_dims) - 1)], 768)
         
         # If align_at_block is specified, we'll extract features at that specific downsample block
         self.align_at_block = align_at_block if align_at_block is not None else 0
 
-        self.down_blocks = nn.ModuleList([
-            DownsampleBlock(hd, num_blocks_per_downsample) for _ in range(num_downsample_blocks)
-        ])
+        # Create dimension pairs for transitions
+        self.down_blocks = nn.ModuleList()
+        for i in range(num_downsample_blocks):
+            in_dim = hidden_dims[min(i, len(hidden_dims) - 1)]
+            out_dim = hidden_dims[min(i + 1, len(hidden_dims) - 1)]
+            self.down_blocks.append(DownsampleBlock(in_dim, out_dim, num_blocks_per_downsample))
 
-        self.out = conv(hd, latent_channels)
+        final_dim = hidden_dims[min(num_downsample_blocks, len(hidden_dims) - 1)]
+        self.out = nn.Sequential(
+            conv(final_dim, latent_channels),
+            Clamp()  # Bound latents to [-6, 6] for stability
+        )
         
     def forward(self, x):
         x = self.inp(x)
@@ -123,11 +134,10 @@ class Encoder(nn.Module):
         return x, align_proj
 
 class Decoder(nn.Module):
-    def __init__(self, latent_channels=4, hidden_dim=64, num_upsample_blocks=3, num_blocks_per_upsample=3, patch_size=16, align_at_block=None):
+    def __init__(self, latent_channels=4, hidden_dims=[64], num_upsample_blocks=3, num_blocks_per_upsample=3, patch_size=16, align_at_block=None):
         super().__init__()
-        hd = hidden_dim
+        hd = hidden_dims[0]
         self.inp = nn.Sequential(*[
-            Clamp(), 
             conv(latent_channels, hd), 
             nn.ReLU(),
         ])
@@ -135,15 +145,19 @@ class Decoder(nn.Module):
         # If align_at_block is specified, we'll extract features at that specific upsample block
         self.align_at_block = align_at_block if align_at_block is not None else 0
 
-        self.up_blocks = nn.ModuleList([
-            UpsampleBlock(hd, num_blocks_per_upsample) for _ in range(num_upsample_blocks)
-        ])
+        # Create dimension pairs for transitions (reverse order compared to encoder)
+        self.up_blocks = nn.ModuleList()
+        for i in range(num_upsample_blocks):
+            in_dim = hidden_dims[min(i, len(hidden_dims) - 1)]
+            out_dim = hidden_dims[min(i + 1, len(hidden_dims) - 1)]
+            self.up_blocks.append(UpsampleBlock(in_dim, out_dim, num_blocks_per_upsample))
 
-        self.alignment_layer = build_mlp(hidden_dim, 768)
+        self.alignment_layer = build_mlp(hidden_dims[0] if align_at_block == -1 or align_at_block is None else hidden_dims[min(align_at_block + 1, len(hidden_dims) - 1)], 768)
 
+        final_dim = hidden_dims[min(num_upsample_blocks, len(hidden_dims) - 1)]
         self.out = nn.Sequential(*[
-            Block(hd, hd),
-            Unpatchify(hd, 3, patch_size)
+            Block(final_dim, final_dim),
+            Unpatchify(final_dim, 3, patch_size)
         ])
 
     def forward(self, z):
@@ -167,10 +181,10 @@ class Decoder(nn.Module):
         return z, align_proj
 
 class MeiKai(nn.Module):
-    def __init__(self, latent_channels=4, hidden_dim=64, num_blocks=3, blocks_per_stage=3, patch_size=8, encoder_align_at_block=None, decoder_align_at_block=None):
+    def __init__(self, latent_channels=4, hidden_dims=[64], num_blocks=3, blocks_per_stage=3, patch_size=8, encoder_align_at_block=None, decoder_align_at_block=None):
         super().__init__()
-        self.encoder = Encoder(latent_channels, hidden_dim, num_blocks, blocks_per_stage, patch_size, encoder_align_at_block)
-        self.decoder = Decoder(latent_channels, hidden_dim, num_blocks, blocks_per_stage, patch_size, decoder_align_at_block)
+        self.encoder = Encoder(latent_channels, hidden_dims, num_blocks, blocks_per_stage, patch_size, encoder_align_at_block)
+        self.decoder = Decoder(latent_channels, list(reversed(hidden_dims)), num_blocks, blocks_per_stage, patch_size, decoder_align_at_block)
 
 def AE_F32D256(**kwargs):
     """
@@ -187,7 +201,7 @@ def AE_F32D256(**kwargs):
     """
     return MeiKai(
         latent_channels=256,
-        hidden_dim=768,
+        hidden_dims=[256, 512, 768],
         num_blocks=3,
         blocks_per_stage=2,
         patch_size=4,
@@ -206,7 +220,7 @@ def main():
     print(f"Input image shape: {random_image.shape}")
     
     # Create the autoencoder
-    ae = MeiKai(hidden_dim=768, latent_channels=768, num_blocks=1, blocks_per_stage=2, patch_size=16).to(dev)
+    ae = MeiKai(hidden_dims=[768], latent_channels=768, num_blocks=1, blocks_per_stage=2, patch_size=16).to(dev)
     # print parameters
     def nparams(m): 
         return sum(p.numel() for p in m.parameters())

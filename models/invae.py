@@ -177,6 +177,7 @@ class Encoder(nn.Module):
         resolution=256,
         z_channels=16,
         double_z=True,
+        align_at_level=None,
         **ignore_kwargs,
     ):
         super().__init__()
@@ -186,6 +187,7 @@ class Encoder(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
         self.in_channels = in_channels
+        self.align_at_level = align_at_level
 
         # downsampling
         self.conv_in = torch.nn.Conv2d(
@@ -245,8 +247,19 @@ class Encoder(nn.Module):
             stride=1,
             padding=1,
         )
+        
+        # Alignment projection layer (project features to 768 dims for DINO alignment)
+        if self.align_at_level is not None:
+            align_channels = ch * ch_mult[self.align_at_level]
+            self.alignment_proj = nn.Sequential(
+                nn.Linear(align_channels, 768),
+                nn.SiLU(),
+                nn.Linear(768, 768),
+            )
+        else:
+            self.alignment_proj = None
 
-    def forward(self, x):
+    def forward(self, x, return_align_proj=False):
         # assert x.shape[2] == x.shape[3] == self.resolution, "{}, {}, {}".format(x.shape[2], x.shape[3], self.resolution)
 
         # timestep embedding
@@ -254,6 +267,7 @@ class Encoder(nn.Module):
 
         # downsampling
         hs = [self.conv_in(x)]
+        align_features = None
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)
@@ -262,6 +276,10 @@ class Encoder(nn.Module):
                 hs.append(h)
             if i_level != self.num_resolutions - 1:
                 hs.append(self.down[i_level].downsample(hs[-1]))
+            
+            # Extract alignment features at specified level
+            if return_align_proj and self.align_at_level == i_level:
+                align_features = hs[-1]
 
         # middle
         h = hs[-1]
@@ -273,6 +291,14 @@ class Encoder(nn.Module):
         h = self.norm_out(h)
         h = nonlinearity(h)
         h = self.conv_out(h)
+        
+        if return_align_proj and align_features is not None:
+            # Project alignment features: [B, C, H, W] -> [B, H, W, C] -> [B, H*W, C] -> [B, H*W, 768]
+            b, c, h_feat, w_feat = align_features.shape
+            align_proj = align_features.permute(0, 2, 3, 1).reshape(b, h_feat * w_feat, c)
+            align_proj = self.alignment_proj(align_proj)
+            return h, align_proj
+        
         return h
 
 
@@ -291,6 +317,7 @@ class Decoder(nn.Module):
         resolution=256,
         z_channels=16,
         give_pre_end=False,
+        align_at_level=None,
         **ignore_kwargs,
     ):
         super().__init__()
@@ -301,6 +328,7 @@ class Decoder(nn.Module):
         self.resolution = resolution
         self.in_channels = in_channels
         self.give_pre_end = give_pre_end
+        self.align_at_level = align_at_level
 
         # compute in_ch_mult, block_in and curr_res at lowest res
         in_ch_mult = (1,) + tuple(ch_mult)
@@ -365,8 +393,19 @@ class Decoder(nn.Module):
         self.conv_out = torch.nn.Conv2d(
             block_in, out_ch, kernel_size=3, stride=1, padding=1
         )
+        
+        # Alignment projection layer (project features to 768 dims for DINO alignment)
+        if self.align_at_level is not None:
+            align_channels = ch * ch_mult[self.align_at_level]
+            self.alignment_proj = nn.Sequential(
+                nn.Linear(align_channels, 768),
+                nn.SiLU(),
+                nn.Linear(768, 768),
+            )
+        else:
+            self.alignment_proj = None
 
-    def forward(self, z):
+    def forward(self, z, return_align_proj=False):
         # assert z.shape[1:] == self.z_shape[1:]
         self.last_z_shape = z.shape
 
@@ -382,11 +421,17 @@ class Decoder(nn.Module):
         h = self.mid.block_2(h, temb)
 
         # upsampling
+        align_features = None
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
                 h = self.up[i_level].block[i_block](h, temb)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
+            
+            # Extract alignment features BEFORE upsampling (to get current resolution)
+            if return_align_proj and self.align_at_level == i_level:
+                align_features = h
+            
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
@@ -397,6 +442,14 @@ class Decoder(nn.Module):
         h = self.norm_out(h)
         h = nonlinearity(h)
         h = self.conv_out(h)
+        
+        if return_align_proj and align_features is not None:
+            # Project alignment features: [B, C, H, W] -> [B, H, W, C] -> [B, H*W, C] -> [B, H*W, 768]
+            b, c, h_feat, w_feat = align_features.shape
+            align_proj = align_features.permute(0, 2, 3, 1).reshape(b, h_feat * w_feat, c)
+            align_proj = self.alignment_proj(align_proj)
+            return h, align_proj
+        
         return h
 
 
@@ -450,51 +503,148 @@ class DiagonalGaussianDistribution(object):
 
 
 class AutoencoderKL(nn.Module):
-    def __init__(self, embed_dim, ch_mult, use_variational=True):
+    def __init__(self, embed_dim, ch_mult, use_variational=True, encoder_align_at_level=None, decoder_align_at_level=None, patch_size=1, ch=128):
         super().__init__()
-        self.encoder = Encoder(ch_mult=ch_mult, z_channels=embed_dim)
-        self.decoder = Decoder(ch_mult=ch_mult, z_channels=embed_dim)
         self.use_variational = use_variational
+        self.encoder_align_at_level = encoder_align_at_level
+        self.decoder_align_at_level = decoder_align_at_level
+        self.patch_size = patch_size
+        self.ch = ch
+        
+        # Patchify/unpatchify layers for patch_size > 1
+        # When patchifying, we need to increase channels to preserve information
+        if self.patch_size > 1:
+            # Patchify: expand channels to compensate for spatial reduction
+            # Similar to meikai.py approach
+            self.patch_embed = torch.nn.Conv2d(
+                3, ch, kernel_size=patch_size, stride=patch_size, padding=0
+            )
+            self.patch_unembed = torch.nn.ConvTranspose2d(
+                ch, 3, kernel_size=patch_size, stride=patch_size, padding=0
+            )
+            # Encoder and decoder need to work with 'ch' channels instead of 3
+            self.encoder = Encoder(ch_mult=ch_mult, z_channels=embed_dim, align_at_level=encoder_align_at_level, in_channels=ch)
+            self.decoder = Decoder(ch_mult=ch_mult, z_channels=embed_dim, align_at_level=decoder_align_at_level, out_ch=ch)
+        else:
+            self.encoder = Encoder(ch_mult=ch_mult, z_channels=embed_dim, align_at_level=encoder_align_at_level)
+            self.decoder = Decoder(ch_mult=ch_mult, z_channels=embed_dim, align_at_level=decoder_align_at_level)
+        
         mult = 2 if self.use_variational else 1
         self.quant_conv = torch.nn.Conv2d(2 * embed_dim, mult * embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, embed_dim, 1)
+    
+    def patchify(self, x):
+        """Convert image to patches if patch_size > 1"""
+        if self.patch_size > 1:
+            return self.patch_embed(x)
+        return x
+    
+    def unpatchify(self, x):
+        """Convert patches back to image if patch_size > 1"""
+        if self.patch_size > 1:
+            return self.patch_unembed(x)
+        return x
 
-    def encode(self, x):
-        h = self.encoder(x)
+    def encode(self, x, return_align_proj=False):
+        # Patchify input if patch_size > 1
+        x = self.patchify(x)
+        
+        if return_align_proj and self.encoder_align_at_level is not None:
+            h, align_proj = self.encoder(x, return_align_proj=True)
+        else:
+            h = self.encoder(x, return_align_proj=False)
+            align_proj = None
+        
         moments = self.quant_conv(h)
         if not self.use_variational:
             moments = torch.cat((moments, torch.ones_like(moments)), 1)
         posterior = DiagonalGaussianDistribution(moments)
+        
+        if return_align_proj:
+            return posterior, align_proj
         return posterior
 
-    def decode(self, z):
+    def decode(self, z, return_align_proj=False):
         # NOTE: We wrap the output in a dict to be consistent with the output
         z = self.post_quant_conv(z)
-        dec = self.decoder(z)
-        return dictdot(dict(sample=dec))
+        if return_align_proj and self.decoder_align_at_level is not None:
+            dec, align_proj = self.decoder(z, return_align_proj=True)
+            # Unpatchify output if patch_size > 1
+            dec = self.unpatchify(dec)
+            return dictdot(dict(sample=dec)), align_proj
+        else:
+            dec = self.decoder(z, return_align_proj=False)
+            # Unpatchify output if patch_size > 1
+            dec = self.unpatchify(dec)
+            return dictdot(dict(sample=dec))
 
-    def forward(self, x, return_recon=True):
-        posterior = self.encode(x)
+    def forward(self, x, return_recon=True, return_align_proj=False):
+        if return_align_proj:
+            posterior, encoder_align_proj = self.encode(x, return_align_proj=True)
+        else:
+            posterior = self.encode(x, return_align_proj=False)
+            encoder_align_proj = None
+        
         z = posterior.sample()
 
         recon = None
+        decoder_align_proj = None
         if return_recon:
-            recon = self.decode(z).sample
+            if return_align_proj:
+                recon_dict, decoder_align_proj = self.decode(z, return_align_proj=True)
+                recon = recon_dict.sample
+            else:
+                recon = self.decode(z, return_align_proj=False).sample
+        
+        if return_align_proj:
+            return posterior, z, recon, encoder_align_proj, decoder_align_proj
         return posterior, z, recon
 
 
 # Predefined VAE architectures
 def VAE_F8D4(**kwargs):
     # [B, 4, 32, 32]
-    return AutoencoderKL(embed_dim=4, ch_mult=[1, 2, 4, 4], use_variational=True, **kwargs)
+    return AutoencoderKL(embed_dim=4, ch_mult=[1, 2, 4, 4], use_variational=True, patch_size=1, **kwargs)
 
 
 def VAE_F16D32(**kwargs):
     # [B, 32, 16, 16] (used in VA-VAE and our model)
-    return AutoencoderKL(embed_dim=32, ch_mult=[1, 1, 2, 2, 4], use_variational=True, **kwargs)
+    # For 256x256 input with 5 levels (4 downsamples): 256→128→64→32→16
+    # Encoder: align at level 3 (after downsample: 32→16, so features are 16x16)
+    # Decoder: starts at 16x16, processes levels in reverse [4,3,2,1,0]
+    #   - Level 4: blocks at 16x16, extract here for 16x16 features
+    return AutoencoderKL(
+        embed_dim=32, 
+        ch_mult=[1, 1, 2, 2, 4], 
+        use_variational=True,
+        encoder_align_at_level=3,  # Encoder: extract after level 3 downsample → 16x16
+        decoder_align_at_level=4,  # Decoder: extract at level 4 before upsample → 16x16
+        patch_size=1,
+        **kwargs
+    )
+
+
+def VAE_F32D256(**kwargs):
+    # [B, 256, 8, 8] (f=32 compression, matching MeiKai AE_F32D256)
+    # For 256x256 input with 4 levels (3 downsamples): (due to patch_size=4) 64→32→16→8
+    # Encoder: align at level 1 (after downsample: 32→16, so features are 16x16 in latent space)
+    # Decoder: starts at 8x8, processes levels in reverse [3,2,1,0]
+    #   - Level 3: blocks at 8x8, then upsample → 16x16
+    #   - Level 2: blocks at 16x16, extract here for 16x16 features
+    return AutoencoderKL(
+        embed_dim=256, 
+        ch_mult=[2, 2, 4, 4], 
+        use_variational=True,
+        encoder_align_at_level=1,  # Encoder: extract after level 1 downsample → 16x16
+        decoder_align_at_level=2,  # Decoder: extract at level 2 before upsample → 16x16
+        patch_size=4,
+        ch=256,  # Use 256 channels after patchify to preserve information
+        **kwargs
+    )
 
 
 vae_models = {
     "f8d4": VAE_F8D4, # [B, 4, 32, 32]
     "f16d32": VAE_F16D32, # [B, 32, 16, 16]
+    "f32d256": VAE_F32D256, # [B, 256, 8, 8]
 }
