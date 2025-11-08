@@ -27,13 +27,11 @@ class Block(nn.Module):
 class DownsampleBlock(nn.Module):
     def __init__(self, hidden_dim=64, num_blocks=3):
         super().__init__()
-        self.pool = nn.AvgPool2d(2, 2)
         self.conv = conv(hidden_dim, hidden_dim, stride=2, bias=False)
         self.blocks = nn.Sequential(
             *[Block(hidden_dim, hidden_dim) for _ in range(num_blocks)]
         )
     def forward(self, x):
-        x = self.pool(x)
         x = self.conv(x)
         x = self.blocks(x)
         return x

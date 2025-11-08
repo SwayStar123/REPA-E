@@ -140,7 +140,7 @@ class CustomDirDataset(Dataset):
 
         # labels
         fname = 'dataset.json'
-        with open(os.path.join(data_dir, fname), 'r') as f:
+        with open(os.path.join(self.images_dir, fname), 'r') as f:
             labels = json.load(f)['labels']
         labels = dict(labels)
         labels = [labels[fname.replace('\\', '/')] for fname in self.image_fnames]

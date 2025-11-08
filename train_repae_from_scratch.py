@@ -428,13 +428,13 @@ def main(args):
                     channel_mask = torch.ones_like(z)
                 else:
                     # MeiKai autoencoder: both encoder and decoder return alignment projections
-                    z, encoder_align_proj = ae.encoder(processed_image)
+                    z, encoder_align_proj = ae.module.encoder(processed_image)
 
                     channel_mask = generate_channel_mask(z.shape[0], z.shape[1], device)
                     if not args.use_structured_latent:
                         channel_mask = torch.ones_like(channel_mask)
 
-                    recon_image, decoder_align_proj = ae.decoder(z * channel_mask)
+                    recon_image, decoder_align_proj = ae.module.decoder(z * channel_mask)
                     # Create a dummy posterior for compatibility with loss function
                     from models.invae import DiagonalGaussianDistribution
                     posterior = DiagonalGaussianDistribution(
@@ -565,7 +565,7 @@ def main(args):
                     "ae_loss": accelerator.gather(ae_loss).mean().detach().item(),
                     "reconstruction_loss": accelerator.gather(ae_loss_dict["reconstruction_loss"].mean()).mean().detach().item(),
                     "perceptual_loss": accelerator.gather(ae_loss_dict["perceptual_loss"].mean()).mean().detach().item(),
-                    "kl_loss": accelerator.gather(ae_loss_dict["kl_loss"].mean()).mean().detach().item(),
+                    # "kl_loss": accelerator.gather(ae_loss_dict["kl_loss"].mean()).mean().detach().item(),
                     "weighted_gan_loss": accelerator.gather(ae_loss_dict["weighted_gan_loss"].mean()).mean().detach().item(),
                     "discriminator_factor": accelerator.gather(ae_loss_dict["discriminator_factor"].mean()).mean().detach().item(),
                     "gan_loss": accelerator.gather(ae_loss_dict["gan_loss"].mean()).mean().detach().item(),
@@ -681,7 +681,7 @@ def parse_args(input_args=None):
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--logging-dir", type=str, default="logs")
     parser.add_argument("--report-to", type=str, default="wandb")
-    parser.add_argument("--sampling-steps", type=int, default=10000)
+    parser.add_argument("--sampling-steps", type=int, default=2000)
     parser.add_argument("--resume-step", type=int, default=0)
     parser.add_argument("--continue-train-exp-dir", type=str, default=None)
     parser.add_argument("--wandb-history-path", type=str, default=None)
@@ -694,7 +694,7 @@ def parse_args(input_args=None):
     parser.add_argument("--qk-norm",  action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bn-momentum", type=float, default=0.1)
-    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
                         help="Whether to compile the model for faster training")
 
     # dataset params

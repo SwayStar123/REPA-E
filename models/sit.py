@@ -389,7 +389,7 @@ class SiT(nn.Module):
         # loss computation
         denoising_loss = None if loss_kwargs["align_only"] else ((x - model_target) ** 2)
 
-        if channel_mask is not None:
+        if channel_mask is not None and denoising_loss is not None:
             denoising_loss = denoising_loss * channel_mask
 
         # Compute alignment loss: zs_tilde (predictions) are paired with zs (targets)
