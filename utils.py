@@ -72,10 +72,32 @@ def load_encoders(enc_type, device, resolution=256):
 
         elif 'dinov2' in encoder_type:
             import timm
-            if 'reg' in encoder_type:
-                encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14_reg')
+            import os
+            import torch.distributed as dist
+            
+            # Only rank 0 should download to avoid race conditions
+            if dist.is_initialized():
+                if dist.get_rank() == 0:
+                    # Download on rank 0
+                    if 'reg' in encoder_type:
+                        encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14_reg')
+                    else:
+                        encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14')
+                dist.barrier()  # Wait for rank 0 to finish downloading
+                
+                if dist.get_rank() != 0:
+                    # Other ranks load after download is complete
+                    if 'reg' in encoder_type:
+                        encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14_reg')
+                    else:
+                        encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14')
             else:
-                encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14')
+                # Non-distributed case
+                if 'reg' in encoder_type:
+                    encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14_reg')
+                else:
+                    encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14')
+            
             del encoder.head
             patch_resolution = 16 * (resolution // 256)
             encoder.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(

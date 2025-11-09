@@ -1,0 +1,25 @@
+accelerate launch train_repae_from_scratch.py \
+    --max-train-steps=400000 \
+    --report-to="wandb" \
+    --allow-tf32 \
+    --seed=0 \
+    --data-dir="dataset" \
+    --output-dir="exps" \
+    --batch-size=256 \
+    --path-type="linear" \
+    --prediction="v" \
+    --weighting="uniform" \
+    --model="SiT-XL/1" \
+    --checkpointing-steps=5000 \
+    --loss-cfg-path="configs/l1_lpips_kl_gan.yaml" \
+    --vae="f32d256" \
+    --enc-type="dinov2-vit-b" \
+    --proj-coeff=0.5 \
+    --encoder-depth=8 \
+    --vae-align-proj-coeff=1.5 \
+    --bn-momentum=0.1 \
+    --mixed-precision="bf16" \
+    --exp-name="sit-xl-invae-f32d256-no-structured-latent-bf16" \
+    --no-use-structured-latent \
+    --ae-architecture="vae" \
+    --resume-step=15000

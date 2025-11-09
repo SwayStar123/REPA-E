@@ -181,12 +181,10 @@ samples/
 samples2/
 wandb/
 evals/
-*.sh
 *.err
 *.out
 *.log
 classify_image_graph_def.pb
-requirements.txt
 evaluate256.py
 
 

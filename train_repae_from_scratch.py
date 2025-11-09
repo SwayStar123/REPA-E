@@ -332,8 +332,9 @@ def main(args):
     # resume
     global_step = 0
     if args.resume_step > 0:
+        save_dir = os.path.join(args.output_dir, args.exp_name)
         ckpt_name = str(args.resume_step).zfill(7) +'.pt'
-        ckpt_path = f'{args.cont_dir}/checkpoints/{ckpt_name}'
+        ckpt_path = os.path.join(save_dir, 'checkpoints', ckpt_name)
 
         # If the checkpoint exists, we load the checkpoint and resume the training
         ckpt = torch.load(ckpt_path, map_location='cpu')
@@ -345,6 +346,14 @@ def main(args):
         optimizer_ae.load_state_dict(ckpt['opt_ae'])
         optimizer_loss_fn.load_state_dict(ckpt['opt_disc'])
         global_step = ckpt['steps']
+        
+        # Update learning rates to match CLI args (preserves optimizer state like momentum)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = args.learning_rate
+        for param_group in optimizer_ae.param_groups:
+            param_group['lr'] = args.vae_learning_rate
+        for param_group in optimizer_loss_fn.param_groups:
+            param_group['lr'] = args.disc_learning_rate
 
     # Allow larger cache size for DYNAMo compilation
     torch._dynamo.config.cache_size_limit = 64
@@ -595,7 +604,7 @@ def main(args):
                     "ae_loss": accelerator.gather(ae_loss).mean().detach().item(),
                     "reconstruction_loss": accelerator.gather(ae_loss_dict["reconstruction_loss"].mean()).mean().detach().item(),
                     "perceptual_loss": accelerator.gather(ae_loss_dict["perceptual_loss"].mean()).mean().detach().item(),
-                    # "kl_loss": accelerator.gather(ae_loss_dict["kl_loss"].mean()).mean().detach().item(),
+                    "kl_loss": accelerator.gather(ae_loss_dict["kl_loss"].mean()).mean().detach().item(),
                     "weighted_gan_loss": accelerator.gather(ae_loss_dict["weighted_gan_loss"].mean()).mean().detach().item(),
                     "discriminator_factor": accelerator.gather(ae_loss_dict["discriminator_factor"].mean()).mean().detach().item(),
                     "gan_loss": accelerator.gather(ae_loss_dict["gan_loss"].mean()).mean().detach().item(),
@@ -744,7 +753,6 @@ def parse_args(input_args=None):
     parser.add_argument("--report-to", type=str, default="wandb")
     parser.add_argument("--sampling-steps", type=int, default=500)
     parser.add_argument("--resume-step", type=int, default=0)
-    parser.add_argument("--continue-train-exp-dir", type=str, default=None)
     parser.add_argument("--wandb-history-path", type=str, default=None)
 
     # SiT model params
@@ -752,7 +760,7 @@ def parse_args(input_args=None):
                         help="The model to train.")
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--encoder-depth", type=int, default=8)
-    parser.add_argument("--qk-norm",  action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--qk-norm",  action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fused-attn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bn-momentum", type=float, default=0.1)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
@@ -811,12 +819,12 @@ def parse_args(input_args=None):
 
     # vae training params
     parser.add_argument("--vae-learning-rate", type=float, default=1e-4)
-    parser.add_argument("--disc-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--disc-learning-rate", type=float, default=2e-5)
     parser.add_argument("--vae-align-proj-coeff", type=float, default=1.5, 
                         help="Alignment coefficient for main REPA loss (latents through diffusion model)")
-    parser.add_argument("--encoder-align-proj-coeff", type=float, default=0.5,
+    parser.add_argument("--encoder-align-proj-coeff", type=float, default=0.1,
                         help="Direct alignment coefficient for encoder features at f=16 (MeiKai autoencoder only)")
-    parser.add_argument("--decoder-align-proj-coeff", type=float, default=0.5,
+    parser.add_argument("--decoder-align-proj-coeff", type=float, default=0.1,
                         help="Direct alignment coefficient for decoder features at f=16 (MeiKai autoencoder only)")
     parser.add_argument("--use-structured-latent", action=argparse.BooleanOptionalAction, default=True,
                     help="Use structured latent space with channel-wise masking during AE training")
