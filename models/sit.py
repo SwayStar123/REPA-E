@@ -373,8 +373,8 @@ class SiT(nn.Module):
         bsz = zs[0].shape[0]
         for i, (z, z_tilde) in enumerate(zip(zs, zs_tilde)):
             for z_j, z_tilde_j in zip(z, z_tilde):
-                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1) 
-                z_j = torch.nn.functional.normalize(z_j, dim=-1) 
+                z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1, eps=1e-6)
+                z_j = torch.nn.functional.normalize(z_j, dim=-1, eps=1e-6)
                 proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
         proj_loss /= (len(zs) * bsz)
 
